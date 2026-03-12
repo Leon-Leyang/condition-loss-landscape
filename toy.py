@@ -110,14 +110,9 @@ def hessian_vector_product(loss, params, vec):
     return hvp
 
 
-def top_hessian_eigenvalue(
-    model: nn.Module,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    power_iters: int = 10,
-) -> float:
+def top_hessian_eigenvalue(model, x, y, power_iters=10):
     model.eval()
-    params = get_params(model)
+    params = [p for p in model.parameters() if p.requires_grad]
 
     logits = model(x)
     loss = F.cross_entropy(logits, y)
@@ -125,14 +120,12 @@ def top_hessian_eigenvalue(
     vec = [torch.randn_like(p) for p in params]
     vec = normalize_vector_list(vec)
 
-    eigval = None
     for _ in range(power_iters):
         hvp = hessian_vector_product(loss, params, vec)
         vec = normalize_vector_list([h.detach() for h in hvp])
 
-        hvp = hessian_vector_product(loss, params, vec)
-        eigval = sum((v * h).sum() for v, h in zip(vec, hvp)).item()
-
+    hvp = hessian_vector_product(loss, params, vec)
+    eigval = sum((v * h).sum() for v, h in zip(vec, hvp)).item()
     return float(eigval)
 
 
