@@ -1,5 +1,5 @@
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import matplotlib.pyplot as plt
 import torch
@@ -16,20 +16,22 @@ class Config:
     seed: int = 0
 
     data_root: str = "./data"
-    subset_size: int = 5000
-    batch_size: int = 5000   # full-batch GD on the subset
+    subset_size: int = 1000
+    batch_size: int = 1000   # full-batch GD on the subset
     num_workers: int = 2
 
     num_classes: int = 10
+    # Loss supported: "mse", "cross_entropy"
+    loss_type: str = "mse"
     lr: float = 2 / 150      # try 2/200, 2/150, 2/100
     weight_decay: float = 0.0
     momentum: float = 0.0    # pure GD-style
-    epochs: int = 1000
+    epochs: int = 5000
 
     sharpness_every: int = 20
     power_iters: int = 10
 
-    log_path: str = "resnet_cifar10_subset5000_eos_log.pt"
+    log_path: str = "resnet_cifar10_subset1000_eos_log.pt"
     loss_plot_path: str = "loss_plot.png"
     sharpness_plot_path: str = "sharpness_plot.png"
 
@@ -59,8 +61,32 @@ def build_loader(cfg: Config) -> DataLoader:
         transform=transform,
     )
 
-    # Use the first 5000 samples for reproducibility
-    subset = Subset(train_dataset, list(range(cfg.subset_size)))
+    if cfg.num_classes > 10:
+        raise ValueError("CIFAR-10 only has 10 classes (0..9).")
+
+    # Build a deterministic, class-balanced subset using only classes 0..num_classes-1.
+    # Total size is exactly cfg.subset_size (remainder distributed over the lowest class ids).
+    rng = random.Random(cfg.seed)
+    targets = train_dataset.targets  # list[int] of length 50000
+
+    per_class = cfg.subset_size // cfg.num_classes
+    remainder = cfg.subset_size % cfg.num_classes
+
+    chosen_indices = []
+    for c in range(cfg.num_classes):
+        count = per_class + (1 if c < remainder else 0)
+        cls_indices = [i for i, t in enumerate(targets) if t == c]
+        if count > len(cls_indices):
+            raise ValueError(
+                f"Requested {count} samples for class {c}, "
+                f"but class has only {len(cls_indices)} samples."
+            )
+        chosen_indices.extend(rng.sample(cls_indices, count))
+
+    # Mix classes so batch composition isn't class-blocked (important if batch_size < subset_size).
+    rng.shuffle(chosen_indices)
+
+    subset = Subset(train_dataset, chosen_indices)
 
     loader = DataLoader(
         subset,
@@ -110,12 +136,38 @@ def hessian_vector_product(loss, params, vec):
     return hvp
 
 
-def top_hessian_eigenvalue(model, x, y, power_iters=10):
-    model.eval()
+def compute_loss_from_logits(logits: torch.Tensor, y: torch.Tensor, cfg: Config):
+    loss_type = cfg.loss_type.lower().strip()
+    if loss_type == "mse":
+        # Squared loss between logits and one-hot labels.
+        y_onehot = F.one_hot(y, num_classes=cfg.num_classes).to(dtype=logits.dtype)
+        return F.mse_loss(logits, y_onehot, reduction="mean")
+    if loss_type in {"cross_entropy", "ce"}:
+        return F.cross_entropy(logits, y)
+    raise ValueError(f"Unknown loss_type={cfg.loss_type!r}. Use 'mse' or 'cross_entropy'.")
+
+
+def top_hessian_eigenvalue(model, x, y, cfg: Config, power_iters=10):
+    # Temporarily switch to train mode (to match training dynamics),
+    # but restore original mode and BatchNorm buffers afterward so the
+    # model itself is not changed by this computation.
+    was_training = model.training
+
+    bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
+    bn_state = [
+        (
+            bn.running_mean.detach().clone(),
+            bn.running_var.detach().clone(),
+            bn.num_batches_tracked.detach().clone(),
+        )
+        for bn in bn_layers
+    ]
+
+    model.train()
     params = [p for p in model.parameters() if p.requires_grad]
 
     logits = model(x)
-    loss = F.cross_entropy(logits, y)
+    loss = compute_loss_from_logits(logits, y, cfg)
 
     vec = [torch.randn_like(p) for p in params]
     vec = normalize_vector_list(vec)
@@ -126,14 +178,25 @@ def top_hessian_eigenvalue(model, x, y, power_iters=10):
 
     hvp = hessian_vector_product(loss, params, vec)
     eigval = sum((v * h).sum() for v, h in zip(vec, hvp)).item()
+
+    # Restore original BatchNorm buffers and training mode.
+    for bn, (running_mean, running_var, num_batches_tracked) in zip(
+        bn_layers, bn_state
+    ):
+        bn.running_mean.data.copy_(running_mean)
+        bn.running_var.data.copy_(running_var)
+        bn.num_batches_tracked.data.copy_(num_batches_tracked)
+
+    model.train(was_training)
+
     return float(eigval)
 
 
 @torch.no_grad()
-def compute_loss_acc(model: nn.Module, x: torch.Tensor, y: torch.Tensor):
+def compute_loss_acc(model: nn.Module, x: torch.Tensor, y: torch.Tensor, cfg: Config):
     model.eval()
     logits = model(x)
-    loss = F.cross_entropy(logits, y).item()
+    loss = compute_loss_from_logits(logits, y, cfg).item()
     acc = (logits.argmax(dim=1) == y).float().mean().item()
     return loss, acc
 
@@ -143,7 +206,7 @@ def plot_loss(history: dict, save_path: str):
     plt.plot(history["step"], history["loss"])
     plt.xlabel("Iteration")
     plt.ylabel("Training Loss")
-    plt.title("ResNet18 on CIFAR-10 subset (5000): Loss")
+    plt.title("ResNet18 on CIFAR-10 subset (1000): Loss")
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
@@ -167,7 +230,7 @@ def plot_sharpness(history: dict, lr: float, save_path: str):
     )
     plt.xlabel("Iteration")
     plt.ylabel("Sharpness")
-    plt.title("ResNet18 on CIFAR-10 subset (5000): Sharpness")
+    plt.title("ResNet18 on CIFAR-10 subset (1000): Sharpness")
     plt.legend()
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
@@ -207,11 +270,11 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         logits = model(x_full)
-        loss = F.cross_entropy(logits, y_full)
+        loss = compute_loss_from_logits(logits, y_full, cfg)
         loss.backward()
         optimizer.step()
 
-        train_loss, train_acc = compute_loss_acc(model, x_full, y_full)
+        train_loss, train_acc = compute_loss_acc(model, x_full, y_full, cfg)
 
         sharpness = None
         if step % cfg.sharpness_every == 0:
@@ -219,6 +282,7 @@ def main():
                 model=model,
                 x=x_full,
                 y=y_full,
+                cfg=cfg,
                 power_iters=cfg.power_iters,
             )
 
@@ -242,7 +306,7 @@ def main():
                 f"eta*sharpness={cfg.lr * sharpness:.6f}"
             )
 
-    torch.save(history, cfg.log_path)
+    torch.save({"cfg": asdict(cfg), "history": history}, cfg.log_path)
     print(f"\nSaved log to: {cfg.log_path}")
 
     plot_loss(history, cfg.loss_plot_path)
