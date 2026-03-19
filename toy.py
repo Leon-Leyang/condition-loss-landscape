@@ -38,7 +38,7 @@ class Config:
     momentum: float = 0.0    # pure GD-style
     epochs: int = 5000
 
-    sharpness_every: int = 20
+    sharpness_every: int = 100000
     power_iters: int = 10
 
     log_path: str = "resnet_cifar10_subset1000_eos_log.pt"
@@ -193,6 +193,10 @@ def plot_sharpness(history: dict, lr: float, save_path: str):
             sharp_steps.append(s)
             sharp_vals.append(sh)
 
+    if len(sharp_steps) == 0:
+        # Nothing to plot (e.g. sharpness_every is larger than epochs).
+        return
+
     plt.figure(figsize=(7, 5))
     plt.plot(sharp_steps, sharp_vals, label="Top Hessian Eigenvalue")
     plt.axhline(
@@ -247,7 +251,7 @@ def main():
         train_acc = (logits.argmax(dim=1) == y_full).float().mean().item()
 
         sharpness = None
-        if step % cfg.sharpness_every == 0:
+        if step % cfg.sharpness_every == 0 and step > 0:
             sharpness = top_hessian_eigenvalue_from_loss(
                 loss=loss,
                 model=model,
