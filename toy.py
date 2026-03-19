@@ -12,13 +12,23 @@ from torch.utils.data import DataLoader, Subset
 
 @dataclass
 class Config:
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # Pick device in priority order: CUDA -> MPS -> CPU
+    device: str = (
+        "cuda"
+        if torch.cuda.is_available()
+        else (
+            "mps"
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            else "cpu"
+        )
+    )
     seed: int = 0
 
     data_root: str = "./data"
     subset_size: int = 1000
     batch_size: int = 1000   # full-batch GD on the subset
-    num_workers: int = 2
+    # macOS multiprocessing can be finicky; default to single-process.
+    num_workers: int = 0
 
     num_classes: int = 10
     # Loss supported: "mse", "cross_entropy"
@@ -42,7 +52,8 @@ cfg = Config()
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def build_loader(cfg: Config) -> DataLoader:
@@ -93,7 +104,7 @@ def build_loader(cfg: Config) -> DataLoader:
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=cfg.num_workers,
-        pin_memory=True,
+        pin_memory=(cfg.device == "cuda"),
     )
     return loader
 
@@ -147,27 +158,8 @@ def compute_loss_from_logits(logits: torch.Tensor, y: torch.Tensor, cfg: Config)
     raise ValueError(f"Unknown loss_type={cfg.loss_type!r}. Use 'mse' or 'cross_entropy'.")
 
 
-def top_hessian_eigenvalue(model, x, y, cfg: Config, power_iters=10):
-    # Temporarily switch to train mode (to match training dynamics),
-    # but restore original mode and BatchNorm buffers afterward so the
-    # model itself is not changed by this computation.
-    was_training = model.training
-
-    bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
-    bn_state = [
-        (
-            bn.running_mean.detach().clone(),
-            bn.running_var.detach().clone(),
-            bn.num_batches_tracked.detach().clone(),
-        )
-        for bn in bn_layers
-    ]
-
-    model.train()
+def top_hessian_eigenvalue_from_loss(loss, model, power_iters=10):
     params = [p for p in model.parameters() if p.requires_grad]
-
-    logits = model(x)
-    loss = compute_loss_from_logits(logits, y, cfg)
 
     vec = [torch.randn_like(p) for p in params]
     vec = normalize_vector_list(vec)
@@ -177,28 +169,8 @@ def top_hessian_eigenvalue(model, x, y, cfg: Config, power_iters=10):
         vec = normalize_vector_list([h.detach() for h in hvp])
 
     hvp = hessian_vector_product(loss, params, vec)
-    eigval = sum((v * h).sum() for v, h in zip(vec, hvp)).item()
-
-    # Restore original BatchNorm buffers and training mode.
-    for bn, (running_mean, running_var, num_batches_tracked) in zip(
-        bn_layers, bn_state
-    ):
-        bn.running_mean.data.copy_(running_mean)
-        bn.running_var.data.copy_(running_var)
-        bn.num_batches_tracked.data.copy_(num_batches_tracked)
-
-    model.train(was_training)
-
+    eigval = sum((v * h).sum() for v, h in zip(vec, hvp)).detach().item()
     return float(eigval)
-
-
-@torch.no_grad()
-def compute_loss_acc(model: nn.Module, x: torch.Tensor, y: torch.Tensor, cfg: Config):
-    model.eval()
-    logits = model(x)
-    loss = compute_loss_from_logits(logits, y, cfg).item()
-    acc = (logits.argmax(dim=1) == y).float().mean().item()
-    return loss, acc
 
 
 def plot_loss(history: dict, save_path: str):
@@ -240,7 +212,7 @@ def plot_sharpness(history: dict, lr: float, save_path: str):
 def main():
     set_seed(cfg.seed)
 
-    print(f"Device: {cfg.device}")
+    print(f"Device selected: {cfg.device}")
     print(f"Learning rate eta = {cfg.lr}")
     print(f"Theoretical EOS threshold 2/eta = {2.0 / cfg.lr:.4f}")
 
@@ -255,8 +227,8 @@ def main():
     )
 
     x_full, y_full = next(iter(loader))
-    x_full = x_full.to(cfg.device, non_blocking=True)
-    y_full = y_full.to(cfg.device, non_blocking=True)
+    x_full = x_full.to(cfg.device, non_blocking=(cfg.device == "cuda"))
+    y_full = y_full.to(cfg.device, non_blocking=(cfg.device == "cuda"))
 
     history = {
         "step": [],
@@ -271,20 +243,19 @@ def main():
 
         logits = model(x_full)
         loss = compute_loss_from_logits(logits, y_full, cfg)
-        loss.backward()
-        optimizer.step()
-
-        train_loss, train_acc = compute_loss_acc(model, x_full, y_full, cfg)
+        train_loss = loss.item()
+        train_acc = (logits.argmax(dim=1) == y_full).float().mean().item()
 
         sharpness = None
         if step % cfg.sharpness_every == 0:
-            sharpness = top_hessian_eigenvalue(
+            sharpness = top_hessian_eigenvalue_from_loss(
+                loss=loss,
                 model=model,
-                x=x_full,
-                y=y_full,
-                cfg=cfg,
                 power_iters=cfg.power_iters,
             )
+
+        loss.backward()
+        optimizer.step()
 
         history["step"].append(step)
         history["loss"].append(train_loss)
