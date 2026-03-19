@@ -33,6 +33,9 @@ class Config:
     num_classes: int = 10
     # Loss supported: "mse", "cross_entropy"
     loss_type: str = "mse"
+    # GroupNorm setting (BatchNorm2d layers are replaced with GroupNorm).
+    # Will be adjusted downward to divide channel count.
+    gn_groups: int = 32
     lr: float = 2 / 150      # try 2/200, 2/150, 2/100
     weight_decay: float = 0.0
     momentum: float = 0.0    # pure GD-style
@@ -117,6 +120,32 @@ def build_model(cfg: Config) -> nn.Module:
         3, 64, kernel_size=3, stride=1, padding=1, bias=False
     )
     model.maxpool = nn.Identity()
+
+    def choose_groups(num_groups: int, num_features: int) -> int:
+        # Ensure groups divides num_features (GroupNorm requires this).
+        g = min(num_groups, num_features)
+        while g > 1 and (num_features % g) != 0:
+            g -= 1
+        return g
+
+    def replace_bn_with_gn(parent: nn.Module) -> None:
+        for child_name, child in parent.named_children():
+            if isinstance(child, nn.BatchNorm2d):
+                num_features = child.num_features
+                gn = nn.GroupNorm(
+                    num_groups=choose_groups(cfg.gn_groups, num_features),
+                    num_channels=num_features,
+                    eps=child.eps,
+                    affine=True,
+                )
+                if child.affine:
+                    gn.weight.data.copy_(child.weight.data)
+                    gn.bias.data.copy_(child.bias.data)
+                setattr(parent, child_name, gn)
+            else:
+                replace_bn_with_gn(child)
+
+    replace_bn_with_gn(model)
 
     return model.to(cfg.device)
 
